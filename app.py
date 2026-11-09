@@ -1,110 +1,96 @@
-                st.session_state.scanner = scanner
-                st.session_state.missing_symbols = missing
-                st.success("Angel One login successful. WebSocket connecting...")
+import re
+import threading
+import time
+from datetime import datetime
+from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
-        except Exception as exc:
-            st.error(f"Could not start scanner: {exc}")
+import pandas as pd
+import pyotp
+import requests
+import streamlit as st
+from SmartApi import SmartConnect
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+
+IST = ZoneInfo("Asia/Kolkata")
+MASTER_URL = (
+    "https://margincalculator.angelone.in/OpenAPI_File/files/"
+    "OpenAPIScripMaster.json"
+)
+
+st.set_page_config(
+    page_title="Angel One 1-Min Scanner",
+    page_icon="📈",
+    layout="wide",
+)
+st.title("📈 Angel One — 1 Minute Stock Scanner")
+st.caption("Live LTP • 1-minute candle open • Percentage threshold scanner")
 
 
-if stop:
-    current = st.session_state.get("scanner")
-    if current:
-        current.stop()
-    st.session_state.scanner = None
-    st.info("Scanner stopped.")
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_master():
+    response = requests.get(MASTER_URL, timeout=30)
+    response.raise_for_status()
+    return response.json()
 
 
-scanner = st.session_state.get("scanner")
-if scanner:
-    missing = st.session_state.get("missing_symbols", [])
-    if missing:
-        st.warning("Selected exchange-ல் கிடைக்காத symbols: " + ", ".join(missing))
+def normalize_totp_secret(raw_secret: str) -> str:
+    """Accept a Base32 secret or an otpauth:// URI."""
+    secret = (raw_secret or "").strip()
+    if not secret:
+        raise ValueError("TOTP Secret காலியாக உள்ளது.")
 
-    @st.fragment(run_every="1s")
-    def live_panel():
-        current = st.session_state.get("scanner")
-        if current is None:
-            st.info("Scanner stopped.")
-            return
+    if secret.lower().startswith("otpauth://"):
+        query = parse_qs(urlparse(secret).query)
+        secret = query.get("secret", [""])[0]
 
-        data = pd.DataFrame(current.snapshot())
-        col1, col2, col3 = st.columns(3)
-        col1.metric(
-            "WebSocket",
-            "Connected" if current.connected else "Connecting / Disconnected",
-        )
-        col2.metric("Stocks Watching", len(current.instruments))
-        col3.metric("Threshold", f">= {current.threshold:.2f}%")
-
-        if current.error:
-            st.error(current.error)
-
-        if data.empty or data["ltp"].isna().all():
-            st.info("Live ticks வர காத்திருக்கிறது... Market open மற்றும் WebSocket connection சரிபார்க்கவும்.")
-            return
-
-        hits = data[data["triggered"] == True].copy()
-        st.subheader(f"🚀 Threshold Crossed Stocks ({len(hits)})")
-        if hits.empty:
-            st.info("இதுவரை எந்த stock-மும் threshold-ஐ cross செய்யவில்லை.")
-        else:
-            hits = hits.sort_values("change_pct", ascending=False)
-            hit_view = hits[
-                ["symbol", "minute_open", "ltp", "change_pct", "updated"]
-            ].rename(columns={
-                "symbol": "Stock",
-                "minute_open": "1-min Open",
-                "ltp": "LTP",
-                "change_pct": "Change %",
-                "updated": "Last Tick",
-            })
-            st.dataframe(
-                hit_view.style.format({
-                    "1-min Open": "{:.2f}",
-                    "LTP": "{:.2f}",
-                    "Change %": "+{:.2f}%",
-                }),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        with st.expander("All Watched Stocks", expanded=True):
-            all_view = data[
-                ["symbol", "minute_open", "ltp", "change_pct", "minute", "updated"]
-            ].rename(columns={
-                "symbol": "Stock",
-                "minute_open": "1-min Open",
-                "ltp": "LTP",
-                "change_pct": "Change %",
-                "minute": "Candle Minute",
-                "updated": "Last Tick",
-            })
-            st.dataframe(
-                all_view.style.format({
-                    "1-min Open": "{:.2f}",
-                    "LTP": "{:.2f}",
-                    "Change %": "{:+.2f}%",
-                }),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        st.caption(
-            "1-minute Open என்பது அந்த minute-ல் கிடைக்கும் முதல் live tick. "
-            "Scanner-ஐ minute நடுவில் start செய்தால் முதல் candle partial/approximate. "
-            "இது தகவல் நோக்கத்திற்கான scanner மட்டுமே; orders place செய்யாது."
+    secret = re.sub(r"[\s-]", "", secret).upper().rstrip("=")
+    if not secret or not re.fullmatch(r"[A-Z2-7]+", secret):
+        raise ValueError(
+            "TOTP Secret சரியான Base32 format-ல் இல்லை. "
+            "Authenticator setup-ல் கிடைத்த Secret Key கொடுக்கவும்; "
+            "6-digit OTP கொடுக்க வேண்டாம்."
         )
 
-    live_panel()
-else:
-    st.info(
-        "Sidebar-ல் Angel One credentials, stocks, threshold கொடுத்து "
-        "Connect & Start Scanner அழுத்தவும்."
-    )
-    st.markdown(
-        "**Example:** `RELIANCE,HDFCBANK,TCS` மற்றும் threshold `0.30%` என்றால், "
-        "தற்போதைய 1-minute open-ஐ விட LTP குறைந்தது 0.30% உயர்ந்த stocks மட்டும் காட்டப்படும்."
-    )
+    try:
+        pyotp.TOTP(secret).now()
+    except Exception as exc:
+        raise ValueError("TOTP Secret decode செய்ய முடியவில்லை. Key-ஐ சரிபார்க்கவும்.") from exc
+    return secret
 
-st.divider()
-st.caption("Angel One SmartAPI WebSocket V2 • NSE/BSE EQ • No automatic order placement")
+
+def make_fresh_totp(secret: str) -> str:
+    """Create the OTP immediately before login, avoiding expiry during setup work."""
+    totp = pyotp.TOTP(secret)
+    remaining = totp.interval - (int(time.time()) % totp.interval)
+    # If the current code is about to expire, wait for the next code window.
+    if remaining <= 4:
+        time.sleep(remaining + 0.5)
+    return totp.now()
+
+
+def resolve_symbols(symbols, exchange, master):
+    wanted = {
+        s.strip().upper().removesuffix("-EQ")
+        for s in symbols
+        if s.strip()
+    }
+    found = {}
+    for row in master:
+        if row.get("exch_seg") != exchange:
+            continue
+        trading_symbol = str(row.get("symbol", "")).upper()
+        if trading_symbol.endswith("-EQ") and trading_symbol[:-3] in wanted:
+            found[trading_symbol[:-3]] = {
+                "symbol": trading_symbol,
+                "token": str(row["token"]),
+                "exchange": exchange,
+                "exchange_type": 1 if exchange == "NSE" else 3,
+            }
+    return found, sorted(wanted - set(found))
+
+
+class LiveScanner:
+    def __init__(self, auth_token, api_key, client_code, feed_token, instruments, threshold):
+        self.instruments = instruments
+        self.threshold = float(threshold)
